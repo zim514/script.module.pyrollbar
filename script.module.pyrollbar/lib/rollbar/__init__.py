@@ -25,7 +25,7 @@ import six
 from rollbar.lib import events, filters, dict_merge, parse_qs, text, transport, urljoin, iteritems, defaultJSONEncode
 
 
-__version__ = '0.14.7'
+__version__ = '0.15.0'
 __log_name__ = 'rollbar'
 log = logging.getLogger(__log_name__)
 
@@ -265,6 +265,9 @@ SETTINGS = {
     'http_proxy_user': None,
     'http_proxy_password': None,
     'include_request_body': False,
+    'request_pool_connections': None,
+    'request_pool_maxsize': None,
+    'request_max_retries': None,
 }
 
 _CURRENT_LAMBDA_CONTEXT = None
@@ -319,6 +322,7 @@ def init(access_token, environment='production', scrub_fields=None, url_fields=N
 
     SETTINGS['access_token'] = access_token
     SETTINGS['environment'] = environment
+    _configure_transport(**SETTINGS)
 
     if SETTINGS.get('allow_logging_basic_config'):
         logging.basicConfig()
@@ -368,6 +372,20 @@ def init(access_token, environment='production', scrub_fields=None, url_fields=N
     filters.add_builtin_filters(SETTINGS)
 
     _initialized = True
+
+
+def _configure_transport(**kw):
+    configuration = _requests_configuration(**kw)
+    transport.configure_pool(**configuration)
+
+
+def _requests_configuration(**kw):
+    keys = {
+        'request_pool_connections': 'pool_connections',
+        'request_pool_maxsize': 'pool_maxsize',
+        'request_max_retries': 'max_retries',
+    }
+    return {keys[k]: kw.get(k, None) for k in keys}
 
 
 def lambda_function(f):
@@ -696,11 +714,16 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
 def _walk_trace_chain(cls, exc, trace):
     trace_chain = [_trace_data(cls, exc, trace)]
 
+    seen_exceptions = {exc}
+
     while True:
         exc = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
         if not exc:
             break
         trace_chain.append(_trace_data(type(exc), exc, getattr(exc, '__traceback__', None)))
+        if exc in seen_exceptions:
+            break
+        seen_exceptions.add(exc)
 
     return trace_chain
 
@@ -826,11 +849,7 @@ def _build_person_data(request):
     """
     if hasattr(request, 'rollbar_person'):
         rollbar_person_prop = request.rollbar_person
-        try:
-            person = rollbar_person_prop()
-        except TypeError:
-            person = rollbar_person_prop
-
+        person = rollbar_person_prop() if callable(rollbar_person_prop) else rollbar_person_prop
         if person and isinstance(person, dict):
             return person
         else:
@@ -838,11 +857,7 @@ def _build_person_data(request):
 
     if hasattr(request, 'user'):
         user_prop = request.user
-        try:
-            user = user_prop()
-        except TypeError:
-            user = user_prop
-
+        user = user_prop() if callable(user_prop) else user_prop
         if not user:
             return None
         elif isinstance(user, dict):
@@ -866,11 +881,7 @@ def _build_person_data(request):
 
     if hasattr(request, 'user_id'):
         user_id_prop = request.user_id
-        try:
-            user_id = user_id_prop()
-        except TypeError:
-            user_id = user_id_prop
-
+        user_id = user_id_prop() if callable(user_id_prop) else user_id_prop
         if not user_id:
             return None
         return {'id': text(user_id)}

@@ -18,12 +18,16 @@ Usage:
     logger.addHandler(rollbar_handler)
 
 """
-import copy
 import logging
 import threading
-import time
 
 import rollbar
+
+# hack to fix backward compatibility in Python3
+try:
+    from logging import _checkLevel
+except ImportError:
+    _checkLevel = lambda lvl: lvl
 
 
 class RollbarHandler(logging.Handler):
@@ -36,14 +40,15 @@ class RollbarHandler(logging.Handler):
                  environment=None,
                  level=logging.INFO,
                  history_size=10,
-                 history_level=logging.DEBUG):
+                 history_level=logging.DEBUG,
+                 **kw):
 
         logging.Handler.__init__(self)
 
         if access_token is not None:
-            rollbar.init(access_token, environment)
+            rollbar.init(access_token, environment, **kw)
 
-        self.notify_level = level
+        self.notify_level = _checkLevel(level)
 
         self.history_size = history_size
         if history_size > 0:
@@ -57,7 +62,7 @@ class RollbarHandler(logging.Handler):
         log records we notify Rollbar about instead of which
         records we save to the history.
         """
-        self.notify_level = level
+        self.notify_level = _checkLevel(level)
 
     def setHistoryLevel(self, level):
         """
@@ -68,6 +73,11 @@ class RollbarHandler(logging.Handler):
         logging.Handler.setLevel(self, level)
 
     def emit(self, record):
+        # If the record came from Rollbar's own logger don't report it
+        # to Rollbar
+        if record.name == rollbar.__log_name__:
+            return
+
         level = record.levelname.lower()
 
         if level not in self.SUPPORTED_LEVELS:
@@ -75,8 +85,6 @@ class RollbarHandler(logging.Handler):
 
         exc_info = record.exc_info
 
-        # use the original message, not the formatted one
-        message = record.msg
         extra_data = {
             'args': record.args,
             'record': {
@@ -113,12 +121,12 @@ class RollbarHandler(logging.Handler):
         try:
             # when not in an exception handler, exc_info == (None, None, None)
             if exc_info and exc_info[0]:
-                if message:
+                if record.msg:
                     message_template = {
                         'body': {
                             'trace': {
                                 'exception': {
-                                    'description': message
+                                    'description': record.getMessage()
                                 }
                             }
                         }
@@ -131,7 +139,7 @@ class RollbarHandler(logging.Handler):
                                                extra_data=extra_data,
                                                payload_data=payload_data)
             else:
-                uuid = rollbar.report_message(message,
+                uuid = rollbar.report_message(record.getMessage(),
                                               level=level,
                                               request=request,
                                               extra_data=extra_data,
@@ -158,7 +166,8 @@ class RollbarHandler(logging.Handler):
 
     def _build_history_data(self, record):
         data = {'timestamp': record.created,
-                'message': record.getMessage()}
+                'format': record.msg,
+                'args': record.args}
 
         if hasattr(record, 'rollbar_uuid'):
             data['uuid'] = record.rollbar_uuid
