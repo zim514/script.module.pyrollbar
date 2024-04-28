@@ -4,17 +4,21 @@
        version="0.16.3"
        provider-name="rollbar">
   <requires>
-    <import addon="script.module.requests" version="2.3.0" optional="false"/>
-    <import addon="script.module.six" version="1.9.0" optional="false"/>
+    <import addon="script.module.requests" version="2.31.0" />
+    <import addon="script.module.six" version="1.16.0" />
+    <import addon="xbmc.python" version="3.0.0" />
   </requires>
-  <extension point="xbmc.python.module"
-             library="lib"/>
+  <extension point="xbmc.python.module" library="lib" />
   <extension point="xbmc.addon.metadata">
-    <summary>Error tracking and logging from Python to Rollbar</summary>
-    <description>Python notifier for reporting exceptions, errors, and log messages to Rollbar.</description>
+    <summary lang="en_GB">Error tracking and logging from Python to Rollbar</summary>
+    <description lang="en_GB">Python notifier for reporting exceptions, errors, and log messages to Rollbar.</description>
     <platform>all</platform>
     <license>MIT</license>
     <source>https://github.com/rollbar/pyrollbar</source>
-    <website>https://rollbar.com/docs/notifier/pyrollbar</website>
+    <website>https://docs.rollbar.com/docs/python</website>
+    <assets>
+      <icon>resources/icon.png</icon>
+    </assets>
   </extension>
+
 </addon>
