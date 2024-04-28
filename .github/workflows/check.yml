@@ -1,0 +1,26 @@
+name: Addon Checker
+
+on: [push, pull_request]
+
+jobs:
+  kodi-addon-checker:
+    if: github.repository == 'zim514/script.module.pyrollbar'
+    runs-on: ubuntu-latest
+    name: Kodi addon checker
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: pip install kodi-addon-checker
+
+    - name: Kodi addon checker validation
+      id: kodi-addon-check
+      run: kodi-addon-checker --branch=matrix ./script.module.pyrollbar
