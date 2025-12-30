@@ -16,23 +16,18 @@ import types
 import uuid
 import wsgiref.util
 import warnings
+import queue
+from urllib.parse import parse_qs, urljoin
 
 import requests
-import six
 
-from rollbar.lib import events, filters, dict_merge, parse_qs, text, transport, urljoin, iteritems, defaultJSONEncode
+from rollbar.lib import events, filters, dict_merge, transport, defaultJSONEncode
 
 
-__version__ = '0.16.3'
+__version__ = '1.3.0'
 __log_name__ = 'rollbar'
 log = logging.getLogger(__log_name__)
 
-try:
-    # 2.x
-    import Queue as queue
-except ImportError:
-    # 3.x
-    import queue
 
 # import request objects from various frameworks, if available
 try:
@@ -60,7 +55,7 @@ else:
     del ImproperlyConfigured
 
 try:
-    from werkzeug.wrappers import BaseRequest as WerkzeugRequest
+    from werkzeug.wrappers import Request as WerkzeugRequest
 except (ImportError, SyntaxError):
     WerkzeugRequest = None
 
@@ -86,7 +81,7 @@ except ImportError:
 
 try:
     from google.appengine.api.urlfetch import fetch as AppEngineFetch
-except ImportError:
+except (ImportError, KeyError):
     AppEngineFetch = None
 
 try:
@@ -124,7 +119,7 @@ try:
     from twisted.internet.ssl import CertificateOptions
     from twisted.internet import task, defer, ssl, reactor
     from zope.interface import implementer
-    
+
     @implementer(IPolicyForHTTPS)
     class VerifyHTTPS(object):
         def __init__(self):
@@ -273,9 +268,15 @@ SETTINGS = {
     'environment': 'production',
     'exception_level_filters': [],
     'root': None,  # root path to your code
+    'host': None,  # custom hostname of the current host
     'branch': None,  # git branch name
     'code_version': None,
-    'handler': 'default',  # 'blocking', 'thread' (default), 'async', 'agent', 'tornado', 'gae', 'twisted' or 'httpx'
+    # 'blocking', 'thread' (default), 'async', 'agent', 'tornado', 'gae', 'twisted', 'httpx' or 'thread_pool'
+    # 'async' requires Python 3.4 or higher.
+    # 'httpx' requires Python 3.7 or higher.
+    # 'thread_pool' requires Python 3.2 or higher.
+    'handler': 'default',
+    'thread_pool_workers': None,
     'endpoint': DEFAULT_ENDPOINT,
     'timeout': DEFAULT_TIMEOUT,
     'agent.log_file': 'log.rollbar',
@@ -322,6 +323,8 @@ SETTINGS = {
     'request_pool_connections': None,
     'request_pool_maxsize': None,
     'request_max_retries': None,
+    'batch_transforms': False,
+    'custom_transforms': [],
 }
 
 _CURRENT_LAMBDA_CONTEXT = None
@@ -330,17 +333,20 @@ _LAST_RESPONSE_STATUS = None
 # Set in init()
 _transforms = []
 _serialize_transform = None
+_scrub_redact_transform = None
 
 _initialized = False
 
 from rollbar.lib.transforms.scrub_redact import REDACT_REF
 
 from rollbar.lib import transforms
+from rollbar.lib import type_info
 from rollbar.lib.transforms.scrub import ScrubTransform
 from rollbar.lib.transforms.scruburl import ScrubUrlTransform
 from rollbar.lib.transforms.scrub_redact import ScrubRedactTransform
 from rollbar.lib.transforms.serializable import SerializableTransform
 from rollbar.lib.transforms.shortener import ShortenerTransform
+from rollbar.lib.transforms.batched import BatchedTransform
 
 
 ## public api
@@ -357,7 +363,7 @@ def init(access_token, environment='production', scrub_fields=None, url_fields=N
                  'staging', 'yourname'
     **kw: provided keyword arguments will override keys in SETTINGS.
     """
-    global SETTINGS, agent_log, _initialized, _transforms, _serialize_transform, _threads
+    global SETTINGS, agent_log, _initialized, _transforms, _serialize_transform, _scrub_redact_transform, _threads
 
     if scrub_fields is not None:
        SETTINGS['scrub_fields'] = list(scrub_fields)
@@ -383,6 +389,9 @@ def init(access_token, environment='production', scrub_fields=None, url_fields=N
 
     if SETTINGS.get('handler') == 'agent':
         agent_log = _create_agent_log()
+    elif SETTINGS.get('handler') == 'thread_pool':
+        from rollbar.lib.thread_pool import init_pool
+        init_pool(SETTINGS.get('thread_pool_workers', None))
 
     if not SETTINGS['locals']['safelisted_types'] and SETTINGS['locals']['whitelisted_types']:
         warnings.warn('whitelisted_types deprecated use safelisted_types instead', DeprecationWarning)
@@ -396,12 +405,8 @@ def init(access_token, environment='production', scrub_fields=None, url_fields=N
     #       trace frame values using the ShortReprTransform.
     _serialize_transform = SerializableTransform(safe_repr=SETTINGS['locals']['safe_repr'],
                                                  safelist_types=SETTINGS['locals']['safelisted_types'])
-    _transforms = [
-        ScrubRedactTransform(),
-        _serialize_transform,
-        ScrubTransform(suffixes=[(field,) for field in SETTINGS['scrub_fields']], redact_char='*'),
-        ScrubUrlTransform(suffixes=[(field,) for field in SETTINGS['url_fields']], params_to_scrub=SETTINGS['scrub_fields'])
-    ]
+
+    _scrub_redact_transform = ScrubRedactTransform(suffixes=[(field,) for field in SETTINGS['scrub_fields']], redact_char='*')
 
     # A list of key prefixes to apply our shortener transform to. The request
     # being included in the body key is old behavior and is being retained for
@@ -414,17 +419,32 @@ def init(access_token, environment='production', scrub_fields=None, url_fields=N
     ]
 
     if SETTINGS['locals']['enabled']:
-        shortener_keys.append(('body', 'trace', 'frames', '*', 'code'))
-        shortener_keys.append(('body', 'trace', 'frames', '*', 'args', '*'))
-        shortener_keys.append(('body', 'trace', 'frames', '*', 'kwargs', '*'))
-        shortener_keys.append(('body', 'trace', 'frames', '*', 'locals', '*'))
+        for prefix in (('body', 'trace'), ('body', 'trace_chain', '*')):
+            shortener_keys.append(prefix + ('frames', '*', 'code'))
+            shortener_keys.append(prefix + ('frames', '*', 'args', '*'))
+            shortener_keys.append(prefix + ('frames', '*', 'kwargs', '*'))
+            shortener_keys.append(prefix + ('frames', '*', 'locals', '*'))
 
     shortener_keys.extend(SETTINGS['shortener_keys'])
 
     shortener = ShortenerTransform(safe_repr=SETTINGS['locals']['safe_repr'],
                                    keys=shortener_keys,
                                    **SETTINGS['locals']['sizes'])
-    _transforms.append(shortener)
+    _transforms = [
+        shortener,  # priority: 10
+        _scrub_redact_transform,  # priority: 20
+        _serialize_transform,  # priority: 30
+        ScrubUrlTransform(suffixes=[(field,) for field in SETTINGS['url_fields']],
+                          params_to_scrub=SETTINGS['scrub_fields'])  # priority: 50
+    ]
+
+    # Add custom transforms
+    if len(SETTINGS['custom_transforms']) > 0:
+        _transforms.extend(SETTINGS['custom_transforms'])
+
+    # Sort the transforms by priority
+    _transforms = sorted(_transforms, key=lambda x: x.priority)
+
     _threads = queue.Queue()
     events.reset()
     filters.add_builtin_filters(SETTINGS)
@@ -500,7 +520,7 @@ def report_message(message, level='error', request=None, extra_data=None, payloa
     message: the string body of the message
     level: level to report at. One of: 'critical', 'error', 'warning', 'info', 'debug'
     request: the request object for the context of the message
-    extra_data: dictionary of params to include with the message. 'body' is reserved.
+    extra_data: optional, will be included in the 'custom' section of the payload
     payload_data: param names to pass in the 'data' level of the payload; overrides defaults.
     """
     try:
@@ -523,6 +543,7 @@ def send_payload(payload, access_token):
     - 'gae': calls _send_payload_appengine() (which makes a blocking call to Google App Engine)
     - 'twisted': calls _send_payload_twisted() (which makes an async HTTP request using Twisted and Treq)
     - 'httpx': calls _send_payload_httpx() (which makes an async HTTP request using HTTPX)
+    - 'thread_pool': uses a pool of worker threads to make HTTP requests off the main thread. Returns immediately.
     """
     payload = events.on_payload(payload)
     if payload is False:
@@ -569,6 +590,8 @@ def send_payload(payload, access_token):
         _send_payload_async(payload_str, access_token)
     elif handler == 'thread':
         _send_payload_thread(payload_str, access_token)
+    elif handler == 'thread_pool':
+        _send_payload_thread_pool(payload_str, access_token)
     else:
         # default to 'thread'
         _send_payload_thread(payload_str, access_token)
@@ -676,7 +699,7 @@ class PagedResult(Result):
 
 def _resolve_exception_class(idx, filter):
     cls, level = filter
-    if isinstance(cls, six.string_types):
+    if isinstance(cls, str):
         # Lazily resolve class name
         parts = cls.split('.')
         module = '.'.join(parts[:-1])
@@ -815,7 +838,7 @@ def _trace_data(cls, exc, trace):
         'frames': frames,
         'exception': {
             'class': getattr(cls, '__name__', cls.__class__.__name__),
-            'message': text(exc),
+            'message': str(exc),
         }
     }
 
@@ -852,6 +875,7 @@ def _report_message(message, level, request, extra_data, payload_data):
     if extra_data:
         extra_data = extra_data
         data['body']['message'].update(extra_data)
+        data['custom'] = extra_data
 
     request = _get_actual_request(request)
     _add_request_data(data, request)
@@ -892,7 +916,7 @@ def _build_base_data(request, level='error'):
         'level': level,
         'language': 'python %s' % '.'.join(str(x) for x in sys.version_info[:3]),
         'notifier': SETTINGS['notifier'],
-        'uuid': text(uuid.uuid4()),
+        'uuid': str(uuid.uuid4()),
     }
 
     if SETTINGS.get('code_version'):
@@ -947,9 +971,9 @@ def _build_person_data(request):
         else:
             retval = {}
             if getattr(user, 'id', None):
-                retval['id'] = text(user.id)
+                retval['id'] = str(user.id)
             elif getattr(user, 'user_id', None):
-                retval['id'] = text(user.user_id)
+                retval['id'] = str(user.user_id)
 
             # id is required, so only include username/email if we have an id
             if retval.get('id'):
@@ -966,7 +990,7 @@ def _build_person_data(request):
         user_id = user_id_prop() if callable(user_id_prop) else user_id_prop
         if not user_id:
             return None
-        return {'id': text(user_id)}
+        return {'id': str(user_id)}
 
 
 def _get_func_from_frame(frame):
@@ -979,16 +1003,6 @@ def _get_func_from_frame(frame):
         func = None
 
     return func
-
-
-def _flatten_nested_lists(l):
-    ret = []
-    for x in l:
-        if isinstance(x, list):
-            ret.extend(_flatten_nested_lists(x))
-        else:
-            ret.append(x)
-    return ret
 
 
 def _add_locals_data(trace_data, exc_info):
@@ -1025,15 +1039,7 @@ def _add_locals_data(trace_data, exc_info):
             # Optionally fill in locals for this frame
             if arginfo.locals and _check_add_locals(cur_frame, frame_num, num_frames):
                 # Get all of the named args
-                #
-                # args can be a nested list of args in the case where there
-                # are anonymous tuple args provided.
-                # e.g. in Python 2 you can:
-                #   def func((x, (a, b), z)):
-                #       return x + a + b + z
-                #
-                #   func((1, (1, 2), 3))
-                argspec = _flatten_nested_lists(arginfo.args)
+                argspec = arginfo.args
 
                 if arginfo.varargs is not None:
                     varargspec = arginfo.varargs
@@ -1063,7 +1069,7 @@ def _add_locals_data(trace_data, exc_info):
             cur_frame['keywordspec'] = keywordspec
         if _locals:
             try:
-                cur_frame['locals'] = dict((k, _serialize_frame_data(v)) for k, v in iteritems(_locals))
+                cur_frame['locals'] = {k: _serialize_frame_data(v) for k, v in _locals.items()}
             except Exception:
                 log.exception('Error while serializing frame data.')
 
@@ -1071,10 +1077,11 @@ def _add_locals_data(trace_data, exc_info):
 
 
 def _serialize_frame_data(data):
-    for transform in (ScrubRedactTransform(), _serialize_transform):
-        data = transforms.transform(data, transform)
-
-    return data
+    return transforms.transform(
+        data,
+        [_scrub_redact_transform, _serialize_transform],
+        batch_transforms=SETTINGS['batch_transforms']
+    )
 
 
 def _add_lambda_context_data(data):
@@ -1125,8 +1132,14 @@ def _check_add_locals(frame, frame_num, total_frames):
     """
     # Include the last frames locals
     # Include any frame locals that came from a file in the project's root
+    root = SETTINGS.get('root')
+    if root:
+        # coerce to string, in case root is a Path object
+        root = str(root)
+    else:
+        root = ''
     return any(((frame_num == total_frames - 1),
-                ('root' in SETTINGS and (frame.get('filename') or '').lower().startswith((SETTINGS['root'] or '').lower()))))
+                ('root' in SETTINGS and (frame.get('filename') or '').lower().startswith(root.lower()))))
 
 
 def _get_actual_request(request):
@@ -1265,11 +1278,12 @@ def _build_werkzeug_request_data(request):
         'files_keys': list(request.files.keys()),
     }
 
-    try:
-        if request.json:
-            request_data['body'] = request.json
-    except Exception:
-        pass
+    if SETTINGS['include_request_body']:
+        try:
+            if request.json:
+                request_data['body'] = request.json
+        except Exception:
+            pass
 
     return request_data
 
@@ -1297,13 +1311,15 @@ def _build_bottle_request_data(request):
         'GET': dict(request.query)
     }
 
-    if request.json:
-        try:
-            request_data['body'] = request.body.getvalue()
-        except:
-            pass
-    else:
-        request_data['POST'] = dict(request.forms)
+
+    if SETTINGS['include_request_body']:
+        if request.json:
+            try:
+                request_data['body'] = request.body.getvalue()
+            except:
+                pass
+        else:
+            request_data['POST'] = dict(request.forms)
 
     return request_data
 
@@ -1317,13 +1333,14 @@ def _build_sanic_request_data(request):
         'GET': dict(request.args)
     }
 
-    if request.json:
-        try:
-            request_data['body'] = request.json
-        except:
-            pass
-    else:
-        request_data['POST'] = request.form
+    if SETTINGS['include_request_body']:
+        if request.json:
+            try:
+                request_data['body'] = request.json
+            except:
+                pass
+        else:
+            request_data['POST'] = request.form
 
     return request_data
 
@@ -1350,20 +1367,21 @@ def _build_wsgi_request_data(request):
     if 'QUERY_STRING' in request:
         request_data['GET'] = parse_qs(request['QUERY_STRING'], keep_blank_values=True)
         # Collapse single item arrays
-        request_data['GET'] = dict((k, v[0] if len(v) == 1 else v) for k, v in request_data['GET'].items())
+        request_data['GET'] = {k: (v[0] if len(v) == 1 else v) for k, v in request_data['GET'].items()}
 
     request_data['headers'] = _extract_wsgi_headers(request.items())
 
-    try:
-        length = int(request.get('CONTENT_LENGTH', 0))
-    except ValueError:
-        length = 0
-    input = request.get('wsgi.input')
-    if length and input and hasattr(input, 'seek') and hasattr(input, 'tell'):
-        pos = input.tell()
-        input.seek(0, 0)
-        request_data['body'] = input.read(length)
-        input.seek(pos, 0)
+    if SETTINGS['include_request_body']:
+        try:
+            length = int(request.get('CONTENT_LENGTH', 0))
+        except ValueError:
+            length = 0
+        input = request.get('wsgi.input')
+        if length and input and hasattr(input, 'seek') and hasattr(input, 'tell'):
+            pos = input.tell()
+            input.seek(0, 0)
+            request_data['body'] = input.read(length)
+            input.seek(pos, 0)
 
     return request_data
 
@@ -1379,7 +1397,7 @@ def _build_starlette_request_data(request):
         'params': dict(request.path_params),
     }
 
-    if hasattr(request, '_form'):
+    if hasattr(request, '_form') and request._form is not None:
         request_data['POST'] = {
             k: v.filename if isinstance(v, UploadFile) else v
             for k, v in request._form.items()
@@ -1448,8 +1466,9 @@ def _build_server_data():
     Returns a dictionary containing information about the server environment.
     """
     # server environment
+    host = SETTINGS.get('host') or socket.gethostname()
     server_data = {
-        'host': socket.gethostname(),
+        'host': host,
         'pid': os.getpid()
     }
 
@@ -1466,10 +1485,12 @@ def _build_server_data():
 
 
 def _transform(obj, key=None):
-    for transform in _transforms:
-        obj = transforms.transform(obj, transform, key=key)
-
-    return obj
+    return transforms.transform(
+        obj,
+        _transforms,
+        key=key,
+        batch_transforms=SETTINGS['batch_transforms']
+    )
 
 
 def _build_payload(data):
@@ -1477,7 +1498,7 @@ def _build_payload(data):
     Returns the full payload as a string.
     """
 
-    for k, v in iteritems(data):
+    for k, v in data.items():
         data[k] = _transform(v, key=(k,))
 
     payload = {
@@ -1508,6 +1529,18 @@ def _send_payload_thread(payload_str, access_token):
     thread = threading.Thread(target=_send_payload, args=(payload_str, access_token))
     _threads.put(thread)
     thread.start()
+
+
+def _send_payload_pool(payload_str, access_token):
+    try:
+        _post_api('item/', payload_str, access_token=access_token)
+    except Exception as e:
+        log.exception('Exception while posting item %r', e)
+
+
+def _send_payload_thread_pool(payload_str, access_token):
+    from rollbar.lib.thread_pool import submit
+    submit(_send_payload_pool, payload_str, access_token)
 
 
 def _send_payload_appengine(payload_str, access_token):
@@ -1765,4 +1798,8 @@ def _wsgi_extract_user_ip(environ):
 
 
 def _starlette_extract_user_ip(request):
+    if not hasattr(request, 'client'):
+        return _extract_user_ip_from_headers(request)
+    if not hasattr(request.client, 'host'):
+        return _extract_user_ip_from_headers(request)
     return request.client.host or _extract_user_ip_from_headers(request)
