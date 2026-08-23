@@ -12,6 +12,29 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    - name: Verify GH_TOKEN can push to the repo-scripts fork
+      env:
+        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        # The submitter runs every git command with its output discarded and its exit code
+        # ignored, so a push it cannot perform is still reported as "Addon branch created
+        # successfully" and only surfaces afterwards as a 422 invalid head when the pull
+        # request is opened. Check the credential here so the real cause is named instead.
+        fork="${{ github.actor }}/repo-scripts"
+        if ! gh api user --jq .login > /dev/null; then
+          echo "::error::GH_TOKEN is not a usable credential. Check that the secret is set and the token has not expired."
+          exit 1
+        fi
+        if ! push_access=$(gh api "repos/${fork}" --jq '.permissions.push // false' 2> /dev/null); then
+          echo "No fork at ${fork} yet, the submitter will create one."
+          exit 0
+        fi
+        if [ "${push_access}" != "true" ]; then
+          echo "::error::GH_TOKEN cannot push to ${fork}. It needs a classic PAT with the repo (or public_repo) scope."
+          exit 1
+        fi
+        echo "GH_TOKEN has push access to ${fork}."
+
     - name: Submit to official kodi repository
       id: kodi-addon-submitter
       uses: xbmc/action-kodi-addon-submitter@master
