@@ -12,28 +12,49 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Verify GH_TOKEN can push to the repo-scripts fork
+    - name: Check the GH_TOKEN scopes
       env:
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
-        # The submitter runs every git command with its output discarded and its exit code
-        # ignored, so a push it cannot perform is still reported as "Addon branch created
-        # successfully" and only surfaces afterwards as a 422 invalid head when the pull
-        # request is opened. Check the credential here so the real cause is named instead.
-        fork="${{ github.actor }}/repo-scripts"
+        # A classic token needs repo (or public_repo) to push to the fork. Note that the
+        # permissions field of the repository API describes the account rather than the
+        # token, so it reports push access even for a token that has no scope at all.
         if ! gh api user --jq .login > /dev/null; then
           echo "::error::GH_TOKEN is not a usable credential. Check that the secret is set and the token has not expired."
           exit 1
         fi
-        if ! push_access=$(gh api "repos/${fork}" --jq '.permissions.push // false' 2> /dev/null); then
-          echo "No fork at ${fork} yet, the submitter will create one."
-          exit 0
-        fi
-        if [ "${push_access}" != "true" ]; then
-          echo "::error::GH_TOKEN cannot push to ${fork}. It needs a classic PAT with the repo (or public_repo) scope."
-          exit 1
-        fi
-        echo "GH_TOKEN has push access to ${fork}."
+        scopes=$(gh api -i user 2> /dev/null | tr -d '\r' | awk -F': ' 'tolower($1) == "x-oauth-scopes" {print $2}')
+        echo "Token scopes: ${scopes:-<none reported, fine-grained token>}"
+        case ",${scopes// /}," in
+          *,repo,*|*,public_repo,*) echo "Token carries a scope that allows pushing." ;;
+          *) echo "::warning::GH_TOKEN does not report the repo or public_repo scope. The push below will show whether it can write." ;;
+        esac
+
+    - name: Push the addon branch to the repo-scripts fork
+      env:
+        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        # The submitter action performs this same push with its output sent to /dev/null and
+        # its exit code ignored, so when it fails the run continues and only breaks later on
+        # an unresolvable pull request head. Doing it here surfaces the actual git error, and
+        # leaves the branch in place for the action's pull request step.
+        set -x
+        fork="${{ github.actor }}/repo-scripts"
+        branch="script.module.pyrollbar@matrix"
+        version=$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('$GITHUB_WORKSPACE/script.module.pyrollbar/addon.xml').getroot().get('version'))")
+        git clone --branch matrix --origin upstream --single-branch --depth 1 https://github.com/xbmc/repo-scripts.git /tmp/repo-scripts
+        cd /tmp/repo-scripts
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ secrets.EMAIL }}"
+        git checkout -b "$branch" upstream/matrix
+        rm -rf script.module.pyrollbar
+        cp -r "$GITHUB_WORKSPACE/script.module.pyrollbar" script.module.pyrollbar
+        git add -- script.module.pyrollbar
+        git commit -m "[script.module.pyrollbar] $version" || echo "Nothing to commit, the branch matches the repository already"
+        git push -f "https://${{ github.actor }}:${GH_TOKEN}@github.com/${fork}.git" "$branch"
+        set +x
+        # Confirm the ref really landed, rather than trusting the exit code alone
+        gh api "repos/${fork}/branches/${branch}" --jq '"pushed: \(.name) -> \(.commit.sha[0:7])"'
 
     - name: Submit to official kodi repository
       id: kodi-addon-submitter
